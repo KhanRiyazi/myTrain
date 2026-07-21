@@ -346,7 +346,9 @@ class MLMentor:
             
             df = pd.DataFrame(data.data, columns=data.feature_names)
             df['target'] = data.target
-            self.feature_names = data.feature_names.tolist()
+            # sklearn's feature_names is already a plain list on most versions
+            # (unlike target_names, which is a numpy array) - list() handles both safely
+            self.feature_names = list(data.feature_names)
             
             self.datasets[dataset_name] = {
                 'df': df,
@@ -518,11 +520,75 @@ class MLMentor:
         }
     
     def predict(self, features: List[float], model_id: str = None):
+        if not self.trained_models:
+            raise ValueError("No trained models available yet. Train a model first via POST /api/v1/ds/train")
+
+        if model_id and model_id in self.trained_models:
+            chosen_id = model_id
+        else:
+            # fall back to the most recently trained model
+            chosen_id = list(self.trained_models.keys())[-1]
+
+        model_data = self.trained_models[chosen_id]
+        model = model_data.get('model')
+        scaler = model_data.get('scaler')
+        target_names = model_data.get('target_names') or ['class_0']
+        expected_features = model_data.get('feature_names') or []
+
+        # Simulated / sklearn-unavailable model
+        if model is None or not SKLEARN_AVAILABLE:
+            return {
+                "prediction": 0,
+                "prediction_name": target_names[0],
+                "confidence": 0.85,
+                "model_id": chosen_id,
+                "simulated": True
+            }
+
+        if expected_features and len(features) != len(expected_features):
+            raise ValueError(
+                f"Model '{chosen_id}' expects {len(expected_features)} features, got {len(features)}"
+            )
+
+        X = np.array(features).reshape(1, -1)
+        if scaler is not None:
+            X = scaler.transform(X)
+
+        pred = int(model.predict(X)[0])
+        confidence = 0.9
+        if hasattr(model, 'predict_proba'):
+            confidence = float(model.predict_proba(X).max())
+
         return {
-            "prediction": 0,
-            "prediction_name": self.target_names[0] if self.target_names else "class_0",
-            "confidence": 0.92,
-            "model_id": model_id or "latest"
+            "prediction": pred,
+            "prediction_name": target_names[pred] if pred < len(target_names) else str(pred),
+            "confidence": confidence,
+            "model_id": chosen_id,
+            "simulated": False
+        }
+
+    def list_models(self):
+        return [
+            {
+                "model_id": model_id,
+                "model_type": data.get("model_type"),
+                "target_names": data.get("target_names"),
+                "feature_count": len(data.get("feature_names") or []),
+                "simulated": data.get("simulated", False)
+            }
+            for model_id, data in self.trained_models.items()
+        ]
+
+    def get_model_info(self, model_id: str):
+        if model_id not in self.trained_models:
+            raise ValueError(f"Model '{model_id}' not found")
+        data = self.trained_models[model_id]
+        return {
+            "model_id": model_id,
+            "model_type": data.get("model_type"),
+            "target_names": data.get("target_names"),
+            "feature_names": data.get("feature_names"),
+            "simulated": data.get("simulated", False)
         }
 
 ml_mentor = MLMentor()
@@ -532,7 +598,9 @@ ml_mentor = MLMentor()
 # ============================================================
 def get_dashboard_path():
     possible_paths = [
+        os.path.join(os.path.dirname(__file__), "dashboard.html"),
         os.path.join(os.path.dirname(__file__), "train-dashboard.html"),
+        os.path.join(os.getcwd(), "dashboard.html"),
         os.path.join(os.getcwd(), "train-dashboard.html"),
     ]
     for path in possible_paths:
@@ -655,7 +723,7 @@ async def train_model(
 ):
     try:
         df, target_names = ml_mentor.load_dataset(dataset_name)
-        ml_mentor.prepare_data(df, test_size=test_size)
+        split_info = ml_mentor.prepare_data(df, test_size=test_size)
         model, model_id = ml_mentor.train_model(model_type)
         metrics = ml_mentor.evaluate_model()
         
@@ -673,6 +741,9 @@ async def train_model(
             "feature_importance": metrics["feature_importance"],
             "sample_predictions": metrics["predictions"],
             "sample_actual": metrics["actual"],
+            "train_size": split_info["train_size"],
+            "test_size": split_info["test_size"],
+            "total_features": len(split_info["features"]),
             "simulated": is_simulated,
             "message": f"✅ {model_type} trained on {dataset_name} with {metrics['accuracy']*100:.2f}% accuracy!"
         }
